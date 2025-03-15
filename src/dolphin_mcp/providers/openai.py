@@ -34,14 +34,25 @@ async def generate_with_openai(conversation, model_cfg, all_functions):
     loop = asyncio.get_event_loop()
 
     def do_openai_sync():
+        # Format functions for OpenAI API
+        formatted_functions = []
+        for func in all_functions:
+            formatted_func = {
+                "name": func["name"],
+                "description": func["description"],
+                "parameters": func["parameters"]
+            }
+            formatted_functions.append(formatted_func)
+        
+        # Create completion with tools parameter
         return client.chat.completions.create(
             model=model_name,
             messages=conversation,
             temperature=temperature,
             top_p=top_p,
             max_tokens=max_tokens,
-            functions=all_functions,
-            function_call="auto"
+            tools=[{"type": "function", "function": f} for f in formatted_functions],
+            tool_choice="auto"
         )
 
     try:
@@ -49,15 +60,18 @@ async def generate_with_openai(conversation, model_cfg, all_functions):
         choice = resp.choices[0]
         assistant_text = choice.message.content or ""
         tool_calls = []
-        if choice.message.function_call:
-            fc = choice.message.function_call
-            tool_calls.append({
-                "id": "call_openai",
-                "function": {
-                    "name": fc.name or "unknown_function",
-                    "arguments": fc.arguments or "{}"
-                }
-            })
+        
+        if hasattr(choice.message, 'tool_calls') and choice.message.tool_calls:
+            for tc in choice.message.tool_calls:
+                if tc.type == 'function':
+                    tool_call = {
+                        "id": tc.id,
+                        "function": {
+                            "name": tc.function.name,
+                            "arguments": tc.function.arguments
+                        }
+                    }
+                    tool_calls.append(tool_call)
         return {"assistant_text": assistant_text, "tool_calls": tool_calls}
 
     except APIError as e:

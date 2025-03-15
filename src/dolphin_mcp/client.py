@@ -385,7 +385,12 @@ async def run_interaction(
         tool_calls = gen_result.get("tool_calls", [])
 
         # Add the assistant's message
-        conversation.append({"role":"assistant","content":assistant_text})
+        # Add assistant message with proper tool call information
+        assistant_message = {"role": "assistant", "content": assistant_text}
+        if tool_calls:
+            assistant_message["tool_calls"] = tool_calls
+        conversation.append(assistant_message)
+        logger.info(f"Added assistant message: {json.dumps(assistant_message, indent=2)}")
 
         if not tool_calls:
             break
@@ -423,11 +428,19 @@ async def run_interaction(
             if not quiet_mode:
                 print(json.dumps(result, indent=2))
 
+            # Format the result for the conversation
+            result_content = json.dumps(result)
+            logger.info(f"Adding tool result to conversation: {result_content}")
+            
+            # Add result to conversation with proper formatting
             conversation.append({
-                "role":"function",
+                "role": "tool",
+                "tool_call_id": tc["id"],  # Link result to specific tool call
                 "name": func_name,
-                "content": json.dumps(result)
+                "content": result_content
             })
+            
+            logger.info(f"Updated conversation: {json.dumps(conversation[-2:], indent=2)}")
 
     # 5) Log messages if path is provided
     if log_messages_path:
