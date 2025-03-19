@@ -394,14 +394,15 @@ async def run_interaction(
             func_name = tc["function"]["name"]
             func_args_str = tc["function"].get("arguments","{}")
             try:
-                func_args = json.loads(func_args_str)
-            except:
+                json_string = json.dumps(func_args_str) 
+                func_args = json.loads(json_string)
+            except Exception as e:
                 func_args = {}
 
             parts = func_name.split("_",1)
             if len(parts) != 2:
                 conversation.append({
-                    "role":"function",
+                    "role":"tool",
                     "name": func_name,
                     "content": json.dumps({"error":"Invalid function name format"})
                 })
@@ -413,7 +414,7 @@ async def run_interaction(
 
             if srv_name not in servers:
                 conversation.append({
-                    "role":"function",
+                    "role":"tool",
                     "name": func_name,
                     "content": json.dumps({"error":f"Unknown server: {srv_name}"})
                 })
@@ -424,7 +425,7 @@ async def run_interaction(
                 print(json.dumps(result, indent=2))
 
             conversation.append({
-                "role":"function",
+                "role":"tool",
                 "name": func_name,
                 "content": json.dumps(result)
             })

@@ -1,0 +1,30 @@
+{
+  "mcpServers": {
+    "dolphin-demo-database-sqlite": {
+      "command": "uvx",
+      "args": [
+        "mcp-server-sqlite",
+        "--db-path",
+        "~/.dolphin/dolphin.db"
+      ]
+    } 
+  },
+  "models": [
+
+    {
+      "model": "llama3.3:70b-instruct-q3_K_M",
+      "title": "llama3.3:70b",
+      "client": "http://mammoth:11434",
+      "keep_alive_seconds":"240",
+      "provider": "ollama"
+    },
+    {
+      "model": "qwen2.5:72b-instruct-q3_K_S",
+      "title": "qwen2.5:72b",
+      "client": "http://mammoth:11434",
+      "keep_alive_seconds":"240",
+      "provider": "ollama"
+    }
+    
+  ]
+}
