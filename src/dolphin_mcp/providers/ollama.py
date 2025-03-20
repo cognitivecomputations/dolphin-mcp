@@ -30,6 +30,8 @@ async def generate_with_ollama(conversation, model_cfg, all_functions):
         options["repeat_penalty"] = model_cfg.get("repetition_penalty")
     if "max_tokens" in model_cfg:
         options["num_predict"] = model_cfg.get("max_tokens", 1024)
+    if "seed" in model_cfg:
+        options["seed"] = model_cfg.get("seed", 42)
 
     try:
         response = chat(
