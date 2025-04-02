@@ -10,3 +10,5 @@ jsonschema
 anthropic
 ollama
 lmstudio
+termcolor
+aiofiles

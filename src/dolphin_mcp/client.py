@@ -87,7 +87,7 @@ class SSEMCPClient:
 
 class MCPClient:
     """Implementation for a single MCP server."""
-    def __init__(self, server_name, command, args=None, env=None):
+    def __init__(self, server_name, command, args=None, env=None, cwd=None):
         self.server_name = server_name
         self.command = command
         self.args = args or []
@@ -101,6 +101,7 @@ class MCPClient:
         self.server_capabilities = {}
         self._shutdown = False
         self._cleanup_lock = asyncio.Lock()
+        self.cwd = cwd
 
     async def _receive_loop(self):
         if not self.process or self.process.stdout.at_eof():
@@ -156,7 +157,8 @@ class MCPClient:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
-                env=env_vars
+                env=env_vars,
+                cwd=self.cwd
             )
             self.receive_task = asyncio.create_task(self._receive_loop())
             return await self._perform_initialize()
@@ -473,6 +475,257 @@ async def process_tool_call(tc: Dict, servers: Dict[str, MCPClient], quiet_mode:
         "content": json.dumps(result)
     }
 
+
+class MCPAgent:
+    @classmethod
+    async def create(cls,model_name: Optional[str] = None,
+        config: Optional[dict] = None,
+        config_path: str = "mcp_config.json",
+        quiet_mode: bool = False,
+        log_messages_path: Optional[str] = None,
+        stream: bool = False) -> "MCPAgent":
+        """
+        Create an instance of the MCPAgent using MCPAgent.create(...)
+        async class method so that the initialization can be awaited.
+
+        Args:
+            model_name: Name of the model to use (optional)
+            config: Configuration dict (optional, if not provided will load from config_path)
+            config_path: Path to the configuration file (default: mcp_config.json)
+            quiet_mode: Whether to suppress intermediate output (default: False)
+            log_messages_path: Path to log messages in JSONL format (optional)
+            stream: Whether to stream the response (default: False)
+
+        Returns:
+            An instance of MCPAgent 
+        """        
+        obj = cls()
+        await obj._initialize(model_name, config, config_path, quiet_mode, log_messages_path, stream)
+        return obj
+    
+    def __init__(self):
+        pass
+
+    async def _initialize(self,
+        model_name: Optional[str] = None,
+        config: Optional[dict] = None,
+        config_path: str = "mcp_config.json",
+        quiet_mode: bool = False,
+        log_messages_path: Optional[str] = None,
+        stream: bool = False) -> Union[str, AsyncGenerator[str, None]]:
+
+        self.stream = stream
+        self.log_messages_path = log_messages_path
+        self.quiet_mode = quiet_mode
+
+        # 1) If config is not provided, load from file:
+        if config is None:
+            config = await load_mcp_config_from_file(config_path)
+
+        servers_cfg = config.get("mcpServers", {})
+        models_cfg = config.get("models", [])
+
+        # 2) Choose a model
+        self.chosen_model = None
+        if model_name:
+            for m in models_cfg:
+                if m.get("model") == model_name or m.get("title") == model_name:
+                    self.chosen_model = m
+                    break
+            if not self.chosen_model:
+                # fallback to default or fail
+                for m in models_cfg:
+                    if m.get("default"):
+                        self.chosen_model = m
+                        break
+        else:
+            # if model_name not specified, pick default
+            for m in models_cfg:
+                if m.get("default"):
+                    self.chosen_model = m
+                    break
+            if not self.chosen_model and models_cfg:
+                self.chosen_model = models_cfg[0]
+
+        if not self.chosen_model:
+            error_msg = "No suitable model found in config."
+            if stream:
+                async def error_gen():
+                    yield error_msg
+                return error_gen()
+            return error_msg
+
+        # 3) Start servers
+        self.servers = {}
+        self.all_functions = []
+        for server_name, conf in servers_cfg.items():
+            if "url" in conf:  # SSE server
+                client = SSEMCPClient(server_name, conf["url"])
+            else:  # Local process-based server
+                client = MCPClient(
+                    server_name=server_name,
+                    command=conf.get("command"),
+                    args=conf.get("args", []),
+                    env=conf.get("env", {}),
+                    cwd=conf.get("cwd", None)
+                )
+            ok = await client.start()
+            if not ok:
+                if not quiet_mode:
+                    print(f"[WARN] Could not start server {server_name}")
+                continue
+            else:
+                print(f"[OK] {server_name}")
+
+            # gather tools
+            tools = await client.list_tools()
+            for t in tools:
+                input_schema = t.get("inputSchema") or {"type": "object", "properties": {}}
+                fn_def = {
+                    "name": f"{server_name}_{t['name']}",
+                    "description": t.get("description", ""),
+                    "parameters": input_schema
+                }
+                self.all_functions.append(fn_def)
+
+            self.servers[server_name] = client
+
+        if not self.servers:
+            error_msg = "No MCP servers could be started."
+            if stream:
+                async def error_gen():
+                    yield error_msg
+                return error_gen()
+            return error_msg
+
+        self.conversation = []
+
+        # 4) Build conversation
+        # Get system message - either from systemMessageFile, systemMessage, or default
+        system_msg = "You are a helpful assistant."
+        if "systemMessageFile" in self.chosen_model:
+            try:
+                with open(self.chosen_model["systemMessageFile"], "r", encoding="utf-8") as f:
+                    system_msg = f.read()
+            except Exception as e:
+                logger.warning(f"Failed to read system message file: {e}")
+                # Fall back to direct systemMessage if available
+                self.conversation.append({"role": "system", "content": self.chosen_model.get("systemMessage", system_msg)})
+        else:
+            self.conversation.append({"role": "system", "content": self.chosen_model.get("systemMessage", system_msg)})
+        if "systemMessageFiles" in self.chosen_model:
+            for file in self.chosen_model["systemMessageFiles"]:
+                try:
+                    with open(file, "r", encoding="utf-8") as f:
+                        system_msg = f.read()
+                        self.conversation.append({"role": "system", "content": "File: " + file + "\n" + system_msg})
+                except Exception as e:
+                    logger.warning(f"Failed to read system message file: {e}")
+
+    async def cleanup(self):
+        """Clean up servers and log messages"""
+        if self.log_messages_path:
+            await log_messages_to_file(self.conversation, self.all_functions, self.log_messages_path)
+        for cli in self.servers.values():
+            await cli.stop()
+        self.servers.clear()
+
+    async def prompt(self, user_query):
+        """
+        Prompt the specified model along with the configured MCP servers.
+
+        Args:
+            user_query: The user's query
+
+        Returns:
+            If self.stream=False: The final text response
+            If self.stream=True: AsyncGenerator yielding chunks of the response
+        """        
+        self.conversation.append({"role": "user", "content": user_query})
+
+        if self.stream:
+            async def stream_response():
+                try:
+                    while True:  # Main conversation loop
+                        generator = await generate_text(self.conversation, self.chosen_model, self.all_functions, stream=True)
+                        accumulated_text = ""
+                        tool_calls_processed = False
+                        
+                        async for chunk in await generator:
+                            if chunk.get("is_chunk", False):
+                                # Immediately yield each token without accumulation
+                                if chunk.get("token", False):
+                                    yield chunk["assistant_text"]
+                                accumulated_text += chunk["assistant_text"]
+                            else:
+                                # This is the final chunk with tool calls
+                                if accumulated_text != chunk["assistant_text"]:
+                                    # If there's any remaining text, yield it
+                                    remaining = chunk["assistant_text"][len(accumulated_text):]
+                                    if remaining:
+                                        yield remaining
+                                
+                                # Process any tool calls from the final chunk
+                                tool_calls = chunk.get("tool_calls", [])
+                                if tool_calls:
+                                    # Add type field to each tool call
+                                    for tc in tool_calls:
+                                        tc["type"] = "function"
+                                    # Add the assistant's message with tool calls
+                                    assistant_message = {
+                                        "role": "assistant",
+                                        "content": chunk["assistant_text"],
+                                        "tool_calls": tool_calls
+                                    }
+                                    self.conversation.append(assistant_message)
+                                    
+                                    # Process each tool call
+                                    for tc in tool_calls:
+                                        if tc.get("function", {}).get("name"):
+                                            result = await process_tool_call(tc, self.servers, self.quiet_mode)
+                                            if result:
+                                                self.conversation.append(result)
+                                                tool_calls_processed = True
+                        
+                        # Break the loop if no tool calls were processed
+                        if not tool_calls_processed:
+                            break
+                        
+                finally:
+                    pass
+            return stream_response()
+        else:
+            try:
+                final_text = ""
+                while True:
+                    gen_result = await generate_text(self.conversation, self.chosen_model, self.all_functions, stream=False)
+                    
+                    assistant_text = gen_result["assistant_text"]
+                    final_text = assistant_text
+                    tool_calls = gen_result.get("tool_calls", [])
+
+                    # Add the assistant's message
+                    assistant_message = {"role": "assistant", "content": assistant_text}
+                    if tool_calls:
+                        # Add type field to each tool call
+                        for tc in tool_calls:
+                            tc["type"] = "function"
+                        assistant_message["tool_calls"] = tool_calls
+                    self.conversation.append(assistant_message)
+                    logger.info(f"Added assistant message: {json.dumps(assistant_message, indent=2)}")
+
+                    if not tool_calls:
+                        break
+
+                    for tc in tool_calls:
+                        result = await process_tool_call(tc, self.servers, self.quiet_mode)
+                        if result:
+                            self.conversation.append(result)
+                            logger.info(f"Added tool result: {json.dumps(result, indent=2)}")
+
+            finally:
+                return final_text
+            
 async def run_interaction(
     user_query: str,
     model_name: Optional[str] = None,
@@ -498,199 +751,8 @@ async def run_interaction(
         If stream=False: The final text response
         If stream=True: AsyncGenerator yielding chunks of the response
     """
-    # 1) If config is not provided, load from file:
-    if config is None:
-        config = await load_mcp_config_from_file(config_path)
+    agent = await MCPAgent.create(model_name, config, config_path, quiet_mode, log_messages_path, stream)
+    response = await agent.prompt(user_query)
+    await agent.cleanup()
+    return response
 
-    servers_cfg = config.get("mcpServers", {})
-    models_cfg = config.get("models", [])
-
-    # 2) Choose a model
-    chosen_model = None
-    if model_name:
-        for m in models_cfg:
-            if m.get("model") == model_name or m.get("title") == model_name:
-                chosen_model = m
-                break
-        if not chosen_model:
-            # fallback to default or fail
-            for m in models_cfg:
-                if m.get("default"):
-                    chosen_model = m
-                    break
-    else:
-        # if model_name not specified, pick default
-        for m in models_cfg:
-            if m.get("default"):
-                chosen_model = m
-                break
-        if not chosen_model and models_cfg:
-            chosen_model = models_cfg[0]
-
-    if not chosen_model:
-        error_msg = "No suitable model found in config."
-        if stream:
-            async def error_gen():
-                yield error_msg
-            return error_gen()
-        return error_msg
-
-    # 3) Start servers
-    servers = {}
-    all_functions = []
-    for server_name, conf in servers_cfg.items():
-        if "url" in conf:  # SSE server
-            client = SSEMCPClient(server_name, conf["url"])
-        else:  # Local process-based server
-            client = MCPClient(
-                server_name=server_name,
-                command=conf.get("command"),
-                args=conf.get("args", []),
-                env=conf.get("env", {})
-            )
-        ok = await client.start()
-        if not ok:
-            if not quiet_mode:
-                print(f"[WARN] Could not start server {server_name}")
-            continue
-        else:
-            print(f"[OK] {server_name}")
-
-        # gather tools
-        tools = await client.list_tools()
-        for t in tools:
-            input_schema = t.get("inputSchema") or {"type": "object", "properties": {}}
-            fn_def = {
-                "name": f"{server_name}_{t['name']}",
-                "description": t.get("description", ""),
-                "parameters": input_schema
-            }
-            all_functions.append(fn_def)
-
-        servers[server_name] = client
-
-    if not servers:
-        error_msg = "No MCP servers could be started."
-        if stream:
-            async def error_gen():
-                yield error_msg
-            return error_gen()
-        return error_msg
-
-    conversation = []
-
-    # 4) Build conversation
-    # Get system message - either from systemMessageFile, systemMessage, or default
-    system_msg = "You are a helpful assistant."
-    if "systemMessageFile" in chosen_model:
-        try:
-            with open(chosen_model["systemMessageFile"], "r", encoding="utf-8") as f:
-                system_msg = f.read()
-        except Exception as e:
-            logger.warning(f"Failed to read system message file: {e}")
-            # Fall back to direct systemMessage if available
-            conversation.append({"role": "system", "content": chosen_model.get("systemMessage", system_msg)})
-    else:
-        conversation.append({"role": "system", "content": chosen_model.get("systemMessage", system_msg)})
-    if "systemMessageFiles" in chosen_model:
-        for file in chosen_model["systemMessageFiles"]:
-            try:
-                with open(file, "r", encoding="utf-8") as f:
-                    system_msg = f.read()
-                    conversation.append({"role": "system", "content": "File: " + file + "\n" + system_msg})
-            except Exception as e:
-                logger.warning(f"Failed to read system message file: {e}")
-
-    conversation.append({"role": "user", "content": user_query})
-
-    async def cleanup():
-        """Clean up servers and log messages"""
-        if log_messages_path:
-            await log_messages_to_file(conversation, all_functions, log_messages_path)
-        for cli in servers.values():
-            await cli.stop()
-
-    if stream:
-        async def stream_response():
-            try:
-                while True:  # Main conversation loop
-                    generator = await generate_text(conversation, chosen_model, all_functions, stream=True)
-                    accumulated_text = ""
-                    tool_calls_processed = False
-                    
-                    async for chunk in await generator:
-                        if chunk.get("is_chunk", False):
-                            # Immediately yield each token without accumulation
-                            if chunk.get("token", False):
-                                yield chunk["assistant_text"]
-                            accumulated_text += chunk["assistant_text"]
-                        else:
-                            # This is the final chunk with tool calls
-                            if accumulated_text != chunk["assistant_text"]:
-                                # If there's any remaining text, yield it
-                                remaining = chunk["assistant_text"][len(accumulated_text):]
-                                if remaining:
-                                    yield remaining
-                            
-                            # Process any tool calls from the final chunk
-                            tool_calls = chunk.get("tool_calls", [])
-                            if tool_calls:
-                                # Add type field to each tool call
-                                for tc in tool_calls:
-                                    tc["type"] = "function"
-                                # Add the assistant's message with tool calls
-                                assistant_message = {
-                                    "role": "assistant",
-                                    "content": chunk["assistant_text"],
-                                    "tool_calls": tool_calls
-                                }
-                                conversation.append(assistant_message)
-                                
-                                # Process each tool call
-                                for tc in tool_calls:
-                                    if tc.get("function", {}).get("name"):
-                                        result = await process_tool_call(tc, servers, quiet_mode)
-                                        if result:
-                                            conversation.append(result)
-                                            tool_calls_processed = True
-                    
-                    # Break the loop if no tool calls were processed
-                    if not tool_calls_processed:
-                        break
-                    
-            finally:
-                await cleanup()
-        
-        return stream_response()
-    else:
-        try:
-            final_text = ""
-            while True:
-                gen_result = await generate_text(conversation, chosen_model, all_functions, stream=False)
-                
-                assistant_text = gen_result["assistant_text"]
-                final_text = assistant_text
-                tool_calls = gen_result.get("tool_calls", [])
-
-                # Add the assistant's message
-                assistant_message = {"role": "assistant", "content": assistant_text}
-                if tool_calls:
-                    # Add type field to each tool call
-                    for tc in tool_calls:
-                        tc["type"] = "function"
-                    assistant_message["tool_calls"] = tool_calls
-                conversation.append(assistant_message)
-                logger.info(f"Added assistant message: {json.dumps(assistant_message, indent=2)}")
-
-                if not tool_calls:
-                    break
-
-                for tc in tool_calls:
-                    result = await process_tool_call(tc, servers, quiet_mode)
-                    if result:
-                        conversation.append(result)
-                        logger.info(f"Added tool result: {json.dumps(result, indent=2)}")
-
-            return final_text
-        finally:
-            await cleanup()

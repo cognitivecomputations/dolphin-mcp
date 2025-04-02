@@ -50,6 +50,7 @@ def parse_arguments():
     args = sys.argv[1:]
     chosen_model = None
     quiet_mode = False
+    chat_mode = False
     config_path = "mcp_config.json"  # default
     log_messages_path = None
     user_query_parts = []
@@ -64,6 +65,9 @@ def parse_arguments():
                 sys.exit(1)
         elif args[i] == "--quiet":
             quiet_mode = True
+            i += 1
+        elif args[i] == "--chat":
+            chat_mode = True
             i += 1
         elif args[i] == "--config":
             if i + 1 < len(args):
@@ -87,4 +91,4 @@ def parse_arguments():
             i += 1
 
     user_query = " ".join(user_query_parts)
-    return chosen_model, user_query, quiet_mode, config_path, log_messages_path
+    return chosen_model, user_query, quiet_mode, chat_mode, config_path, log_messages_path
