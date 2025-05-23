@@ -432,7 +432,10 @@ async def process_tool_call(tc: Dict, servers: Dict[str, MCPClient], quiet_mode:
     try:
         func_args = json.loads(func_args_str)
     except:
-        func_args = {}
+        if isinstance(func_args_str, dict):
+            func_args = func_args_str
+        else:
+            func_args = {}
 
     parts = func_name.split("_", 1)
     if len(parts) != 2:
