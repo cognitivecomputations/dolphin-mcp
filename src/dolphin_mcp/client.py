@@ -162,6 +162,24 @@ class MCPClient:
                 cwd=self.cwd
             )
             self.receive_task = asyncio.create_task(self._receive_loop())
+            # Print subprocess stdout to current process stdout
+            async def _print_stdout(proc):
+                while True:
+                    line = await proc.stdout.readline()
+                    if not line:
+                        break
+                    logger.debug(f"[{self.server_name} STDOUT]", line.decode().rstrip(), file=sys.stdout)
+                    await asyncio.sleep(0.01)  # Throttle to avoid busy loop
+            asyncio.create_task(_print_stdout(self.process))
+            # Print subprocess stderr to current process stderr
+            async def _print_stderr(proc):
+                while True:
+                    line = await proc.stderr.readline()
+                    if not line:
+                        break
+                    logger.error(f"[{self.server_name} STDERR]", line.decode().rstrip(), file=sys.stderr)
+                    await asyncio.sleep(0.01)  # Throttle to avoid busy loop
+            asyncio.create_task(_print_stderr(self.process))
             return await self._perform_initialize()
         except Exception:
             return False
