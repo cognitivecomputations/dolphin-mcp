@@ -159,7 +159,8 @@ class MCPClient:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 env=env_vars,
-                cwd=self.cwd
+                cwd=self.cwd,
+                limit=1 << 20 # Set a larger buffer size for stdout
             )
             self.receive_task = asyncio.create_task(self._receive_loop())
             return await self._perform_initialize()
